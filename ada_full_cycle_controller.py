@@ -12,7 +12,7 @@ from pybit.unified_trading import HTTP
 
 
 # ============================================================
-# ADA FULL CYCLE CONTROLLER — BYBIT DEMO
+# ADA FULL CYCLE CONTROLLER — BYBIT DEMO1
 # Восстановление ордеров, подробное логирование, без дублей
 # ============================================================
 

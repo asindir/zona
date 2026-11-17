@@ -460,36 +460,20 @@ def place_once(name, params):
 def place_stop_short_with_fallback():
     stop = Decimal(state["prices"]["STOP"])
 
-    base_params = {
+    params = {
         "category": CATEGORY,
         "symbol": SYMBOL,
         "side": "Buy",
+        "orderType": "Market",
         "qty": validate_qty(LOT_SELL2, stop),
         "triggerPrice": fmt(stop),
         "triggerDirection": 1,
         "triggerBy": "LastPrice",
-        "timeInForce": "IOC",
         "positionIdx": SHORT_IDX,
         "reduceOnly": True
     }
 
-    try:
-        params = dict(base_params)
-        params["orderType"] = "Market"
-        return place_once("STOP_SHORT", params)
-    except Exception as first_error:
-        log.warning(
-            "STOP_SHORT: Market+triggerPrice не принят (%s). "
-            "Пробую orderType=StopMarket.", first_error
-        )
-
-    try:
-        params = dict(base_params)
-        params["orderType"] = "StopMarket"
-        return place_once("STOP_SHORT", params)
-    except Exception as second_error:
-        log.error("STOP_SHORT: StopMarket тоже не принят: %s", second_error)
-        raise
+    return place_once("STOP_SHORT", params)
 
 # ============================================================
 # CANCEL

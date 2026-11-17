@@ -1,4 +1,3 @@
-
 import os
 import json
 import time
@@ -10,10 +9,10 @@ from decimal import Decimal, ROUND_DOWN, ROUND_UP
 from dotenv import load_dotenv
 from pybit.unified_trading import HTTP
 
-
 # ============================================================
-# ADA FULL CYCLE CONTROLLER — BYBIT DEMO1
+# ADA FULL CYCLE CONTROLLER — BYBIT DEMO
 # Восстановление ордеров, подробное логирование, без дублей
+# Серия циклов с паузой между ними (см. блок SERIES)
 # ============================================================
 
 BASE_DIR = Path(__file__).resolve().parent
@@ -32,9 +31,9 @@ SYMBOL = "ADAUSDT"
 # ПАРАМЕТРЫ СТРАТЕГИИ — НЕ ИЗМЕНЯТЬ
 ZONE_PERCENT = Decimal("0.7")
 TP1_PERCENT = Decimal("0.7")
-TP2_PERCENT = Decimal("1.9")
-TP3_PERCENT = Decimal("0.3")
-STOP_BUFFER_PERCENT = Decimal("-0.06")
+TP2_PERCENT = Decimal("0.7")
+TP3_PERCENT = Decimal("0.7")
+STOP_BUFFER_PERCENT = Decimal("-0.7")
 
 LOT_BUY1 = Decimal("100")
 LOT_SELL2 = Decimal("160")
@@ -54,7 +53,14 @@ EXPECTED_QTY = {
     "S2": Decimal("160"),
     "TP2": Decimal("160"),
     "B3": Decimal("1200"),
+    "TP3": Decimal("1300"),   # <<< добавлено: TP3 — лимитка на 1300
 }
+
+# >>> SERIES: параметры серии циклов
+TF_SECONDS = 300          # 5 минут — таймфрейм "свечи"
+PAUSE_CANDLES = 2         # пауза между циклами в свечах
+MAX_CYCLES = 10           # предохранитель: максимум циклов за запуск
+# <<< SERIES
 
 logging.basicConfig(
     level=logging.INFO,
@@ -66,7 +72,6 @@ logging.basicConfig(
 )
 
 log = logging.getLogger("ADA_CONTROLLER")
-
 
 # ============================================================
 # DEMO CONNECTION
@@ -85,7 +90,6 @@ session = HTTP(
     recv_window=20000
 )
 
-
 def check(response, name="API"):
     if not isinstance(response, dict):
         raise RuntimeError(f"{name}: некорректный ответ API")
@@ -97,7 +101,6 @@ def check(response, name="API"):
         )
 
     return response.get("result", {})
-
 
 # ============================================================
 # STATE
@@ -111,7 +114,6 @@ def new_state():
         "created_at": time.time()
     }
 
-
 def load_state():
     if not STATE_FILE.exists():
         return new_state()
@@ -123,9 +125,7 @@ def load_state():
 
     return data
 
-
 state = load_state()
-
 
 def save_state():
     temp_file = STATE_FILE.with_suffix(".tmp")
@@ -137,12 +137,40 @@ def save_state():
 
     os.replace(temp_file, STATE_FILE)
 
-
 def set_status(status):
     state["status"] = status
     save_state()
     log.info("СОСТОЯНИЕ: %s", status)
 
+# >>> SERIES: архивирование и сброс state между циклами
+def archive_state(cycle_no):
+    if not STATE_FILE.exists():
+        return
+
+    stamp = time.strftime("%Y%m%d_%H%M%S")
+    archive = STATE_FILE.with_name(
+        f"ada_full_cycle_state_{stamp}_cycle{cycle_no}.json"
+    )
+
+    try:
+        archive.write_text(
+            STATE_FILE.read_text(encoding="utf-8"),
+            encoding="utf-8"
+        )
+        log.info(
+            "State цикла #%s архивирован: %s",
+            cycle_no, archive.name
+        )
+    except Exception as error:
+        log.warning("Не удалось архивировать state: %s", error)
+
+def reset_state_for_next_cycle(cycle_no):
+    archive_state(cycle_no)
+    state.clear()
+    state.update(new_state())
+    save_state()
+    log.info("State сброшен в NEW для следующего цикла")
+# <<< SERIES
 
 # ============================================================
 # LOCK
@@ -166,13 +194,11 @@ def acquire_lock():
             "что другой процесс завершён."
         )
 
-
 def release_lock():
     try:
         LOCK_FILE.unlink(missing_ok=True)
     except Exception as error:
         log.warning("Не удалось удалить lock-файл: %s", error)
-
 
 # ============================================================
 # INSTRUMENT FILTERS
@@ -203,9 +229,7 @@ def get_filters():
         )
     }
 
-
 FILTERS = get_filters()
-
 
 def round_price(value, rounding=ROUND_DOWN):
     value = Decimal(str(value))
@@ -215,10 +239,8 @@ def round_price(value, rounding=ROUND_DOWN):
         value / tick
     ).to_integral_value(rounding=rounding) * tick
 
-
 def fmt(value):
     return format(Decimal(str(value)).normalize(), "f")
-
 
 def validate_qty(qty, price=None):
     qty = Decimal(str(qty))
@@ -235,7 +257,6 @@ def validate_qty(qty, price=None):
             raise RuntimeError("Сумма ордера меньше minNotionalValue.")
 
     return fmt(qty)
-
 
 # ============================================================
 # POSITIONS
@@ -272,7 +293,6 @@ def get_positions():
 
     return positions
 
-
 # ============================================================
 # OPEN ORDERS
 # ============================================================
@@ -289,7 +309,6 @@ def get_open_orders():
     )
 
     return result.get("list", [])
-
 
 # ============================================================
 # ORDER LOOKUP
@@ -341,7 +360,6 @@ def find_order(link_id=None, order_id=None):
                 return order
 
     return None
-
 
 # ============================================================
 # EXECUTION HISTORY
@@ -408,7 +426,6 @@ def get_execution_status(name, item):
         "qty": fmt(expected)
     }
 
-
 # ============================================================
 # RECONCILIATION
 # ============================================================
@@ -459,7 +476,6 @@ def reconcile_order(name, attempts=RECONCILE_ATTEMPTS):
 
     return None
 
-
 def order_status(name):
     item = state["orders"].get(name)
 
@@ -499,13 +515,11 @@ def order_status(name):
 
         return None
 
-
 def is_filled(order):
     return (
         order is not None
         and order.get("orderStatus") == "Filled"
     )
-
 
 def is_partial(order):
     return (
@@ -516,7 +530,6 @@ def is_partial(order):
         )
     )
 
-
 def is_active(order):
     return (
         order is not None
@@ -526,7 +539,6 @@ def is_active(order):
             "PartiallyFilled"
         )
     )
-
 
 # ============================================================
 # SAFE ORDER SUBMISSION
@@ -652,7 +664,6 @@ def place_once(name, params):
         "orderStatus": "Unknown"
     }
 
-
 # ============================================================
 # CANCEL ORDER
 # ============================================================
@@ -716,11 +727,9 @@ def cancel_order(name):
         f"Не удалось подтвердить отмену {name}"
     )
 
-
 def cancel_all_strategy_orders():
     for name in list(state["orders"].keys()):
         cancel_order(name)
-
 
 # ============================================================
 # WAIT FOR FILL
@@ -774,7 +783,6 @@ def wait_filled(name, timeout=120):
         f"Истекло время ожидания исполнения {name}"
     )
 
-
 # ============================================================
 # POSITION CHECKS
 # ============================================================
@@ -797,7 +805,6 @@ def wait_position(idx, expected, timeout=60):
         f"Позиция idx={idx}: ожидали {expected}, получили {actual}"
     )
 
-
 def verify_flat():
     positions = get_positions()
 
@@ -816,7 +823,6 @@ def verify_flat():
         raise RuntimeError(
             f"Остались открытые ордера: {len(active)}"
         )
-
 
 # ============================================================
 # MARKET CLOSE
@@ -846,7 +852,6 @@ def close_position_market(idx, name):
 
     wait_filled(name, timeout=120)
     wait_position(idx, Decimal("0"), timeout=60)
-
 
 # ============================================================
 # ACCOUNT VALIDATION
@@ -896,7 +901,6 @@ def validate_account():
                 "Новый цикл запрещён: есть открытые ордера ADAUSDT."
             )
 
-
 # ============================================================
 # RECOVERY FROM EMPTY ERROR
 # ============================================================
@@ -931,7 +935,6 @@ def recover_empty_error_state():
     state.clear()
     state.update(new_state())
     save_state()
-
 
 # ============================================================
 # STAGE 1 — B1
@@ -983,7 +986,6 @@ def stage1_b1():
 
         state["prices"]["B1"] = fmt(avg)
         set_status("B1_FILLED")
-
 
 # ============================================================
 # STAGE 2 — TP1 + S2
@@ -1042,7 +1044,6 @@ def stage2_orders():
     })
 
     set_status("STAGE2_ACTIVE")
-
 
 # ============================================================
 # MONITOR PAIR
@@ -1137,7 +1138,6 @@ def monitor_pair(first_name, second_name):
 
         time.sleep(POLL_SECONDS)
 
-
 # ============================================================
 # STAGE 3 — OCO MONITOR
 # ============================================================
@@ -1190,7 +1190,6 @@ def stage3_monitor():
 
             set_status("S2_FILLED")
             return
-
 
 # ============================================================
 # STAGE 4 — TP2 + B3
@@ -1249,7 +1248,6 @@ def stage4_orders():
     })
 
     set_status("STAGE4_ACTIVE")
-
 
 # ============================================================
 # STAGE 4 MONITOR
@@ -1328,30 +1326,40 @@ def stage4_monitor():
             save_state()
 
             log.info(
-                "Установка TP3=%s STOP=%s на весь Long",
+                "Установка TP3=%s (лимитка Sell 1300) и STOP=%s (рыночный) на весь Long",
                 tp3, stop
             )
 
+            # === ИЗМЕНЕНИЕ: TP3 — ЛИМИТНАЯ ЗАЯВКА на продажу 1300 ===
+            place_once("TP3", {
+                "category": CATEGORY,
+                "symbol": SYMBOL,
+                "side": "Sell",
+                "orderType": "Limit",
+                "qty": validate_qty(LOT_BUY1 + LOT_BUY3, tp3),  # 1300
+                "price": fmt(tp3),
+                "timeInForce": "GTC",
+                "positionIdx": LONG_IDX,
+                "reduceOnly": True
+            })
+
+            # === ИЗМЕНЕНИЕ: STOP — только stopLoss, без takeProfit ===
+            # чтобы не конфликтовать с лимиткой TP3.
             check(
                 session.set_trading_stop(
                     category=CATEGORY,
                     symbol=SYMBOL,
                     tpslMode="Full",
                     positionIdx=LONG_IDX,
-                    takeProfit=fmt(tp3),
                     stopLoss=fmt(stop),
-                    tpTriggerBy="LastPrice",
                     slTriggerBy="LastPrice",
-                    tpOrderType="Market",
                     slOrderType="Market"
                 ),
-                "Set TP3/STOP"
+                "Set STOP"
             )
 
             set_status("TP3_STOP_ACTIVE")
             return
-
-
 
 def audit_long_close_after_tp3_stop():
     """Read-only audit of recent Long-closing executions; never guesses TP/STOP."""
@@ -1366,7 +1374,7 @@ def audit_long_close_after_tp3_stop():
         executions = result.get("list", [])
     except Exception as exc:
         log.error("TP3/STOP AUDIT: не удалось получить executions: %s", exc)
-        return
+        return None
 
     # Only sell executions closing the Long hedge leg; Short opening is positionIdx=2.
     rows = []
@@ -1386,9 +1394,8 @@ def audit_long_close_after_tp3_stop():
 
     if not rows:
         log.warning("TP3/STOP AUDIT: закрывающие Long исполнения не найдены; причина=UNKNOWN")
-        return
+        return None
 
-    # Prefer the most recent matching close fills. Fetch each order's exchange metadata.
     order_groups = {}
     for ex, qty, price in rows:
         oid = ex.get("orderId") or "UNKNOWN"
@@ -1400,6 +1407,8 @@ def audit_long_close_after_tp3_stop():
         group["pnl"] += Decimal(str(ex.get("execPnl") or "0"))
         group["times"].append(int(ex.get("execTime") or 0))
         group["execs"].append(ex)
+
+    reasons = []
 
     for oid, g in order_groups.items():
         meta = None
@@ -1413,21 +1422,31 @@ def audit_long_close_after_tp3_stop():
         meta = meta or {}
         stype = str(meta.get("stopOrderType") or "").lower()
         ctype = str(meta.get("createType") or "").lower()
-        if "takeprofit" in stype or "takeprofit" in ctype:
+        otype = str(meta.get("orderType") or "").lower()
+
+        # === ИЗМЕНЕНИЕ: различаем TP3-лимитку и STOP ===
+        if "takeprofit" in stype or "takeprofit" in ctype or otype == "limit":
             reason = "TP3"
         elif "stoploss" in stype or "stoploss" in ctype:
             reason = "STOP"
         else:
             reason = "UNKNOWN"
+
+        reasons.append(reason)
+
         avg = g["value"] / g["qty"] if g["qty"] else Decimal("0")
         times = [t for t in g["times"] if t]
         stamp = datetime.datetime.fromtimestamp(max(times)/1000).astimezone().isoformat() if times else "UNKNOWN"
         log.info("LONG CLOSE AUDIT: reason=%s symbol=%s orderId=%s qty=%s avgExecPrice=%s "
                  "fee=%s execPnl=%s execTime=%s triggerPrice=%s stopOrderType=%s createType=%s "
-                 "orderStatus=%s", reason, SYMBOL, oid, g["qty"], avg, g["fee"], g["pnl"],
+                 "orderType=%s orderStatus=%s", reason, SYMBOL, oid, g["qty"], avg, g["fee"], g["pnl"],
                  stamp, meta.get("triggerPrice"), meta.get("stopOrderType"), meta.get("createType"),
-                 meta.get("orderStatus"))
+                 meta.get("orderType"), meta.get("orderStatus"))
 
+    if not reasons:
+        return None
+    # Если несколько причин — берём первую (обычно одна закрывающая сделка).
+    return reasons[0]
 
 # ============================================================
 # TP3 / STOP MONITOR
@@ -1472,8 +1491,12 @@ def tp3_stop_monitor():
         )
 
         if long_size == 0:
-            log.info("Long позиция стала нулевой. Проверяю историю исполнений Bybit; остаток Short=%s", short_size)
-            audit_long_close_after_tp3_stop()
+            # === ИЗМЕНЕНИЕ: определяем, что именно закрыло Long — TP3 или STOP ===
+            reason = audit_long_close_after_tp3_stop()
+            log.info(
+                "Long позиция закрыта. Причина: %s. Остаток Short=%s",
+                reason or "UNKNOWN", short_size
+            )
 
             if short_size > 0:
                 close_position_market(
@@ -1488,6 +1511,47 @@ def tp3_stop_monitor():
 
         time.sleep(POLL_SECONDS)
 
+# >>> SERIES: один прогон машины состояний
+def run_one_cycle():
+    while True:
+        current = state["status"]
+
+        if current == "NEW":
+            stage1_b1()
+
+        elif current == "B1_SUBMITTED":
+            stage1_b1()
+
+        elif current == "B1_FILLED":
+            stage2_orders()
+
+        elif current == "STAGE2_ACTIVE":
+            stage3_monitor()
+
+        elif current == "S2_FILLED":
+            stage4_orders()
+
+        elif current == "STAGE4_ACTIVE":
+            stage4_monitor()
+
+        elif current == "TP3_STOP_ACTIVE":
+            tp3_stop_monitor()
+
+        elif current == "CYCLE_COMPLETED":
+            log.info("ЦИКЛ ЗАВЕРШЁН.")
+            return "COMPLETED"
+
+        elif current == "ERROR":
+            log.error("Состояние ERROR. Требуется ручная сверка.")
+            return "ERROR"
+
+        else:
+            raise RuntimeError(
+                f"Неизвестное состояние: {current}"
+            )
+
+        time.sleep(1)
+# <<< SERIES
 
 # ============================================================
 # MAIN
@@ -1499,53 +1563,54 @@ def main():
     try:
         log.info("=" * 55)
         log.info("ADA FULL CYCLE CONTROLLER — BYBIT DEMO")
-        log.info("Состояние: %s", state["status"])
+        log.info(
+            "Серия циклов | MAX_CYCLES=%s | пауза=%s свечей (%ss)",
+            MAX_CYCLES, PAUSE_CANDLES, PAUSE_CANDLES * TF_SECONDS
+        )
         log.info("=" * 55)
 
         validate_account()
         recover_empty_error_state()
 
+        cycle_no = 0
+
         while True:
-            current = state["status"]
+            cycle_no += 1
 
-            if current == "NEW":
-                stage1_b1()
+            log.info("=" * 55)
+            log.info(
+                "СТАРТ ЦИКЛА #%s | состояние=%s",
+                cycle_no, state["status"]
+            )
+            log.info("=" * 55)
 
-            elif current == "B1_SUBMITTED":
-                stage1_b1()
+            result = run_one_cycle()
 
-            elif current == "B1_FILLED":
-                stage2_orders()
-
-            elif current == "STAGE2_ACTIVE":
-                stage3_monitor()
-
-            elif current == "S2_FILLED":
-                stage4_orders()
-
-            elif current == "STAGE4_ACTIVE":
-                stage4_monitor()
-
-            elif current == "TP3_STOP_ACTIVE":
-                tp3_stop_monitor()
-
-            elif current == "CYCLE_COMPLETED":
-                log.info(
-                    "ЦИКЛ ЗАВЕРШЁН. Новые сделки не запускаются."
+            if result == "ERROR":
+                log.error(
+                    "Цикл #%s завершился ERROR. "
+                    "Серия остановлена. Требуется ручная сверка.",
+                    cycle_no
                 )
                 return
 
-            elif current == "ERROR":
-                raise RuntimeError(
-                    "Состояние ERROR. Требуется ручная сверка."
-                )
+            # COMPLETED: финальная проверка flat, архив, сброс
+            verify_flat()
+            reset_state_for_next_cycle(cycle_no)
 
-            else:
-                raise RuntimeError(
-                    f"Неизвестное состояние: {current}"
+            if cycle_no >= MAX_CYCLES:
+                log.info(
+                    "Достигнут MAX_CYCLES=%s. Серия завершена.",
+                    MAX_CYCLES
                 )
+                return
 
-            time.sleep(1)
+            pause = PAUSE_CANDLES * TF_SECONDS
+            log.info(
+                "Пауза %s свечей (%s сек) перед циклом #%s",
+                PAUSE_CANDLES, pause, cycle_no + 1
+            )
+            time.sleep(pause)
 
     except KeyboardInterrupt:
         log.warning(
@@ -1568,7 +1633,6 @@ def main():
 
     finally:
         release_lock()
-
 
 if __name__ == "__main__":
     main()

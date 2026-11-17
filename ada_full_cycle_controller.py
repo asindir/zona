@@ -872,54 +872,78 @@ def stage4_monitor():
         "STOP_SHORT",
         "STOP_LONG",
     )
-
-    def cancel_and_confirm_all():
+#
+        def cancel_and_confirm_all():
         """
-        Отменяем все защитные ордера.
-        После отмены повторно проверяем их статусы.
-        Не считаем запрос отмены подтверждением исполнения.
-        """
-        for name in protection_orders:
-            try:
-                cancel_order(name)
-            except Exception as e:
-                log.warning("Ошибка отмены %s: %s", name, e)
+        Отменяем защитные ордера и подтверждаем,
+        что каждый из них перешёл в конечный статус.
 
-        deadline = time.time() + 15
+        Неизвестный статус или отсутствие ответа —
+        аварийная ситуация, а не подтверждение отмены.
+        """
+
+        terminal_statuses = {
+            "Filled",
+            "Cancelled",
+            "Deactivated",
+            "Rejected",
+            "PartiallyFilledCanceled",
+        }
+
+        deadline = time.time() + 60
 
         while time.time() < deadline:
-            active = []
+            all_terminal = True
 
             for name in protection_orders:
-                try:
-                    order = order_status(name)
-                except Exception as e:
-                    log.error("Не удалось проверить %s: %s", name, e)
-                    raise RuntimeError(
-                        f"Невозможно подтвердить отмену {name}"
-                    )
+                order = order_status(name)
 
-                if not order:
-                    continue
+                # None означает, что статус не удалось получить.
+                # Нельзя считать такой ордер отменённым.
+                if order is None:
+                    raise RuntimeError(
+                        f"{name}: статус неизвестен. "
+                        "Невозможно подтвердить отмену защитного ордера."
+                    )
 
                 status = order.get("orderStatus")
 
-                if status in (
-                    "New",
-                    "Created",
-                    "PartiallyFilled",
-                    "Untriggered",
-                    "Triggered",
-                ):
-                    active.append(name)
+                if status in terminal_statuses:
+                    continue
 
-            if not active:
+                if is_active(order):
+                    all_terminal = False
+
+                    try:
+                        cancel_order(name)
+                    except Exception as error:
+                        log.warning(
+                            "%s: ошибка при отмене: %s. "
+                            "Повторно проверю статус.",
+                            name,
+                            error
+                        )
+
+                    continue
+
+                # Например, Triggered или неизвестный статус:
+                # не считаем его ни отменённым, ни безопасным.
+                raise RuntimeError(
+                    f"{name}: неожиданный статус {status}. "
+                    "Нельзя подтвердить остановку ордера."
+                )
+
+            if all_terminal:
+                log.info(
+                    "Все защитные ордера имеют конечные статусы."
+                )
                 return
 
             time.sleep(1)
 
         raise RuntimeError(
-            "Не удалось подтвердить отмену всех защитных ордеров"
+            "Тайм-аут: не удалось подтвердить остановку "
+            "всех защитных ордеров."
         )
 
     def close_remaining_positions(reason):

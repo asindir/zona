@@ -873,7 +873,7 @@ def stage4_monitor():
         "STOP_LONG",
     )
 #
-        def cancel_and_confirm_all():
+def cancel_and_confirm_all():
         """
         Отменяем защитные ордера и подтверждаем,
         что каждый из них перешёл в конечный статус.

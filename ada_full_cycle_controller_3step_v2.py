@@ -877,85 +877,441 @@ def stage4_orders():
 # ============================================================
 # STAGE 4 MONITOR — OCO между TP2-парой и STOP-парой
 # ============================================================
+# ============================================================
+# STAGE 4 MONITOR — TP2 / STOP
+# ============================================================
 
 def stage4_monitor():
     log.info("ЭТАП 4: мониторинг TP2 и STOP")
+
+    protection_orders = (
+        "TP2_SHORT",
+        "TP2_LONG",
+        "STOP_SHORT",
+        "STOP_LONG",
+    )
+
+    terminal_statuses = {
+        "Filled",
+        "Cancelled",
+        "Deactivated",
+        "Rejected",
+        "PartiallyFilledCanceled",
+    }
+
+    active_statuses = {
+        "New",
+        "Created",
+        "Untriggered",
+        "Triggered",
+        "PartiallyFilled",
+    }
+
+    def cancel_and_confirm_protection():
+        """
+        Отменяем все четыре защитных ордера.
+        После отмены обязательно подтверждаем конечный статус.
+        """
+
+        log.warning("Отменяю все защитные ордера.")
+
+        # Отправляем запрос отмены каждому защитному ордеру.
+        for name in protection_orders:
+            item = state["orders"].get(name)
+
+            if not item or not item.get("link_id"):
+                raise RuntimeError(
+                    f"{name}: отсутствует link_id. "
+                    "Невозможно безопасно отменить ордер."
+                )
+
+            try:
+                check(
+                    session.cancel_order(
+                        category=CATEGORY,
+                        symbol=SYMBOL,
+                        orderLinkId=item["link_id"]
+                    ),
+                    f"Cancel {name}"
+                )
+            except Exception as error:
+                # Ордер мог уже исполниться или отмениться.
+                # Истинный результат определяем по повторной сверке.
+                log.warning(
+                    "%s: запрос отмены вернул ошибку: %s. "
+                    "Проверяю фактический статус.",
+                    name,
+                    error
+                )
+
+        deadline = time.time() + 60
+
+        while time.time() < deadline:
+            pending = []
+
+            for name in protection_orders:
+                order = reconcile_order(name, attempts=1)
+
+                if order is None:
+                    pending.append(name)
+                    continue
+
+                status = order.get("orderStatus")
+
+                if status in terminal_statuses:
+                    continue
+
+                if status in active_statuses:
+                    pending.append(name)
+                    continue
+
+                raise RuntimeError(
+                    f"{name}: неизвестный статус {status}. "
+                    "Невозможно подтвердить остановку ордера."
+                )
+
+            if not pending:
+                log.info(
+                    "Все защитные ордера имеют конечные статусы."
+                )
+                return
+
+            log.warning(
+                "Ожидаю завершения защитных ордеров: %s",
+                ", ".join(pending)
+            )
+
+            # Повторяем запрос отмены для тех,
+            # которые всё ещё остаются активными.
+            for name in pending:
+                item = state["orders"].get(name)
+
+                if not item:
+                    continue
+
+                try:
+                    check(
+                        session.cancel_order(
+                            category=CATEGORY,
+                            symbol=SYMBOL,
+                            orderLinkId=item["link_id"]
+                        ),
+                        f"Cancel retry {name}"
+                    )
+                except Exception as error:
+                    log.warning(
+                        "%s: повторная отмена: %s",
+                        name,
+                        error
+                    )
+
+            time.sleep(1)
+
+        raise RuntimeError(
+            "Не удалось подтвердить остановку всех защитных ордеров."
+        )
+
+    def finish_cycle(reason):
+        """
+        Останавливаем защитные ордера,
+        закрываем фактические остатки,
+        проверяем полностью закрытый цикл.
+        """
+
+        log.warning(
+            "Обнаружено событие %s. Начинаю безопасное завершение цикла.",
+            reason
+        )
+
+        # Сначала прекращаем работу защитных ордеров.
+        cancel_and_confirm_protection()
+
+        # Затем закрываем фактические остатки.
+        close_position_market(
+            SHORT_IDX,
+            f"CLOSE_SHORT_AFTER_{reason}"
+        )
+
+        close_position_market(
+            LONG_IDX,
+            f"CLOSE_LONG_AFTER_{reason}"
+        )
+
+        # Последняя отмена остальных заявок стратегии.
+        cancel_all_strategy_orders()
+
+        # Проверяем отсутствие позиций и открытых ордеров.
+        verify_flat()
+
+        set_status("CYCLE_COMPLETED")
+
+        log.info(
+            "Цикл завершён. Обе позиции закрыты, открытых ордеров нет."
+        )
+
+    unknown_counts = {
+        name: 0
+        for name in protection_orders
+    }
+
     while state["status"] == "STAGE4_ACTIVE":
-        statuses = {
-            name: order_status(name)
-            for name in ("TP2_SHORT", "TP2_LONG", "STOP_SHORT", "STOP_LONG")
-        }
 
-        tp2_short_filled = is_filled(statuses["TP2_SHORT"])
-        tp2_long_filled = is_filled(statuses["TP2_LONG"])
-        stop_short_filled = is_filled(statuses["STOP_SHORT"])
-        stop_long_filled = is_filled(statuses["STOP_LONG"])
+        statuses = {}
 
-        if tp2_short_filled or tp2_long_filled:
-            log.info("TP2 ветка сработала. Отменяю STOP-пару.")
-            cancel_order("STOP_SHORT")
-            cancel_order("STOP_LONG")
-            positions = get_positions()
-            if positions[SHORT_IDX]["size"] > 0:
-                close_position_market(SHORT_IDX, "CLOSE_SHORT_AFTER_TP2")
-            if positions[LONG_IDX]["size"] > 0:
-                close_position_market(LONG_IDX, "CLOSE_LONG_AFTER_TP2")
-            cancel_all_strategy_orders()
-            verify_flat()
-            set_status("CYCLE_COMPLETED")
-            return
+        for name in protection_orders:
+            statuses[name] = order_status(name)
 
-        if stop_short_filled or stop_long_filled:
-            log.info("STOP ветка сработала. Отменяю TP2-пару.")
-            cancel_order("TP2_SHORT")
-            cancel_order("TP2_LONG")
-            positions = get_positions()
-            if positions[SHORT_IDX]["size"] > 0:
-                close_position_market(SHORT_IDX, "CLOSE_SHORT_AFTER_STOP")
-            if positions[LONG_IDX]["size"] > 0:
-                close_position_market(LONG_IDX, "CLOSE_LONG_AFTER_STOP")
-            cancel_all_strategy_orders()
-            verify_flat()
-            set_status("CYCLE_COMPLETED")
-            return
+            if statuses[name] is None:
+                unknown_counts[name] += 1
+
+                log.warning(
+                    "%s: неизвестный статус (%s/%s)",
+                    name,
+                    unknown_counts[name],
+                    MAX_UNKNOWN_POLLS
+                )
+            else:
+                unknown_counts[name] = 0
+
+        # Проверяем, не было ли хотя бы частичного исполнения.
+        executed_orders = []
 
         for name, order in statuses.items():
-            if order and order.get("orderStatus") in (
-                "Cancelled", "Rejected", "Deactivated", "PartiallyFilledCanceled"
+            if order is None:
+                continue
+
+            status = order.get("orderStatus")
+
+            executed_qty = Decimal(
+                str(order.get("cumExecQty") or "0")
+            )
+
+            if (
+                executed_qty > 0
+                or status in (
+                    "Filled",
+                    "PartiallyFilled",
+                    "PartiallyFilledCanceled",
+                )
             ):
-                positions = get_positions()
-                if positions[LONG_IDX]["size"] == 0 and positions[SHORT_IDX]["size"] == 0:
-                    cancel_all_strategy_orders()
-                    verify_flat()
-                    set_status("CYCLE_COMPLETED")
-                    return
-                raise RuntimeError(f"{name}: неожиданный статус {order.get('orderStatus')}")
+                executed_orders.append(name)
+
+        # Если сработала хотя бы одна защита,
+        # прекращаем остальные ордера и закрываем остатки.
+        if executed_orders:
+
+            tp2_executed = any(
+                name.startswith("TP2")
+                for name in executed_orders
+            )
+
+            stop_executed = any(
+                name.startswith("STOP")
+                for name in executed_orders
+            )
+
+            if tp2_executed and stop_executed:
+                log.error(
+                    "КОНФЛИКТ: обнаружено исполнение TP2 и STOP. "
+                    "Закрываю фактические остатки."
+                )
+                finish_cycle("CONFLICT")
+                return
+
+            if tp2_executed:
+                finish_cycle("TP2")
+                return
+
+            finish_cycle("STOP")
+            return
+
+        # Отмена или отклонение без исполнения означает,
+        # что защитная пара больше не гарантирует защиту позиции.
+        protection_lost = []
+
+        for name, order in statuses.items():
+            if order is None:
+                continue
+
+            status = order.get("orderStatus")
+
+            if status in (
+                "Cancelled",
+                "Rejected",
+                "Deactivated",
+            ):
+                protection_lost.append(name)
+
+        if protection_lost:
+            log.error(
+                "Потеря защитного ордера без исполнения: %s",
+                ", ".join(protection_lost)
+            )
+
+            finish_cycle("PROTECTION_LOST")
+            return
+
+        # Если статус долго неизвестен, прекращаем автоматическую работу.
+        unknown_names = [
+            name
+            for name, count in unknown_counts.items()
+            if count >= MAX_UNKNOWN_POLLS
+        ]
+
+        if unknown_names:
+            raise RuntimeError(
+                "Не удалось получить статусы защитных ордеров: "
+                + ", ".join(unknown_names)
+                + ". Требуется ручная сверка."
+            )
 
         time.sleep(POLL_SECONDS)
 
+
 # ============================================================
-# CLOSE MARKET
+# CLOSE MARKET — повторное закрытие фактического остатка
 # ============================================================
 
 def close_position_market(idx, name):
-    position = get_positions()[idx]
-    qty = position["size"]
-    if qty <= 0:
-        return
-    side = "Sell" if idx == LONG_IDX else "Buy"
-    params = {
-        "category": CATEGORY,
-        "symbol": SYMBOL,
-        "side": side,
-        "orderType": "Market",
-        "qty": validate_qty(qty),
-        "positionIdx": idx,
-        "reduceOnly": True,
-        "timeInForce": "IOC"
+
+    terminal_statuses = {
+        "Filled",
+        "Cancelled",
+        "PartiallyFilledCanceled",
     }
-    place_once(name, params)
-    wait_filled(name, timeout=120)
-    wait_position(idx, Decimal("0"), timeout=60)
+
+    for attempt in range(1, 6):
+
+        # Каждый раз заново получаем реальный размер позиции.
+        position = get_positions()[idx]
+        qty = position["size"]
+
+        if qty == 0:
+            log.info(
+                "%s: позиция idx=%s уже закрыта.",
+                name,
+                idx
+            )
+            return
+
+        if qty < 0:
+            raise RuntimeError(
+                f"{name}: получен отрицательный размер позиции {qty}"
+            )
+
+        side = "Sell" if idx == LONG_IDX else "Buy"
+
+        order_name = f"{name}_R{attempt}"
+
+        log.warning(
+            "%s: попытка %s/5, закрываю остаток %s",
+            name,
+            attempt,
+            qty
+        )
+
+        params = {
+            "category": CATEGORY,
+            "symbol": SYMBOL,
+            "side": side,
+            "orderType": "Market",
+            "qty": validate_qty(qty),
+            "positionIdx": idx,
+            "reduceOnly": True,
+            "timeInForce": "IOC"
+        }
+
+        # У каждой попытки собственное имя.
+        # Это позволяет отправить новый ордер на остаток.
+        place_once(order_name, params)
+
+        started = time.time()
+        unknown_count = 0
+        order_finished = False
+
+        while time.time() - started < 120:
+
+            order = order_status(order_name)
+
+            if order is None:
+                unknown_count += 1
+
+                if unknown_count >= MAX_UNKNOWN_POLLS:
+                    raise RuntimeError(
+                        f"{order_name}: статус неизвестен. "
+                        "Повторная отправка запрещена."
+                    )
+
+                time.sleep(POLL_SECONDS)
+                continue
+
+            unknown_count = 0
+
+            status = order.get("orderStatus")
+
+            if status in terminal_statuses:
+                order_finished = True
+                break
+
+            if status in ("Rejected", "Deactivated"):
+                raise RuntimeError(
+                    f"{order_name}: ордер закрытия получил статус {status}"
+                )
+
+            if status in (
+                "New",
+                "Created",
+                "PartiallyFilled",
+            ):
+                time.sleep(POLL_SECONDS)
+                continue
+
+            raise RuntimeError(
+                f"{order_name}: неожиданный статус {status}"
+            )
+
+        if not order_finished:
+            raise RuntimeError(
+                f"{order_name}: истекло время ожидания исполнения. "
+                "Нельзя безопасно отправлять повторный ордер."
+            )
+
+        # После завершения ордера проверяем реальную позицию.
+        remaining = get_positions()[idx]["size"]
+
+        if remaining == 0:
+            log.info(
+                "%s: позиция idx=%s полностью закрыта.",
+                name,
+                idx
+            )
+            return
+
+        log.warning(
+            "%s: после попытки %s остался объём %s. "
+            "Проверяю остаток перед следующей попыткой.",
+            name,
+            attempt,
+            remaining
+        )
+
+        time.sleep(1)
+
+    remaining = get_positions()[idx]["size"]
+
+    if remaining != 0:
+        raise RuntimeError(
+            f"{name}: не удалось закрыть позицию idx={idx}. "
+            f"Остаток={remaining}"
+        )
+
+    log.info("%s: позиция полностью закрыта.", name)
+
+
+# ============================================================
+# RUN ONE CYCLE
+# ============================================================
+
 
 # ============================================================
 # RUN ONE CYCLE
